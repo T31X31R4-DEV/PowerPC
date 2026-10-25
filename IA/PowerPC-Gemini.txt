@@ -1,0 +1,663 @@
+// "Ad Astra Per Aspera"
+// "Por asperos caminhos até as Estrelas"
+// "Para as estrelas através das dificuldades"
+
+#include <Arduino.h>
+
+#ifdef ESP8266
+ #include <ESP8266HTTPClient.h>
+ #include <ESP8266WiFi.h>
+ #include <WiFiManager.h>
+ #include <ESP8266HTTPUpdateServer.h>
+ #include <ESP8266mDNS.h>
+ #include <PubSubClient.h>
+#endif
+
+#include <FS.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// =====================================================
+// CONSTANTES
+// =====================================================
+
+#define BAUD_RATE         115200
+
+#define SEGUNDO           (1000UL)
+#define MINUTO            (60UL * SEGUNDO)
+
+// WEBHOOK
+#define WEBHOOK_URL "http://192.168.2.200:8081/teste"
+
+// =====================================================
+// CONFIG
+// =====================================================
+
+#define ARQ_SENSOR        "/sensor.conf"
+#define ARQ_TEMP_SENSOR   "/sensor.temp"
+
+#define TEXTO_ABERTURA    "PowerPC"
+#define VERSAO            "1.20"
+
+#define SSID_NOME         "PowerPC"
+#define PASS_NOME         ""
+
+// =====================================================
+// PINOS NODEMCU
+// =====================================================
+
+#define PIN_D0    16
+#define PIN_D1     5
+#define PIN_D2     4
+#define PIN_D3     0
+#define PIN_D4     2
+#define PIN_D5    14
+#define PIN_D6    12
+#define PIN_D7    13
+#define PIN_D8    15
+
+// =====================================================
+// ESP-01
+// =====================================================
+
+#define GPIO0 0
+#define TX    1
+#define GPIO2 2
+#define RX    3
+
+#define ESP01 // ESP8266_GENERIC
+
+#ifdef ESP01
+  #define PIN_BOTAO       GPIO0
+  #define PIN_RELE        RX
+  #define PIN_BOTAO_RESET 0xff
+#else
+  #define PIN_BOTAO        PIN_D0
+  #define PIN_RELE         PIN_D1
+  #define PIN_BOTAO_RESET  PIN_D8
+#endif
+
+#ifdef  RELE_NORMAL
+  #define ON    LOW
+  #define OFF   HIGH
+#else
+  #define ON    HIGH
+  #define OFF   LOW
+#endif
+
+#define NTP_SERVER     "pool.ntp.org"
+#define UTC_OFFSET     -3 * 3600
+#define UTC_OFFSET_DST 0
+
+// =====================================================
+// VARIÁVEIS
+// =====================================================
+
+unsigned long ultimaLeituraBotao    = 0;
+unsigned long ultimoEnvioAutomatico = 0;
+unsigned long horarioDesligamento   = 0;
+unsigned long tempoBotaoReset       = 0;
+
+bool desligamentoPendente = false;
+bool releLigado           = false;
+bool mqttLiga             = false;
+bool mqttDesliga          = false;
+bool shouldSaveConfig     = false;
+
+int UltimoValor = 0xff;
+
+// =====================================================
+// DEVICE
+// =====================================================
+
+struct Device
+{
+  String Host;
+  String IPMqtt;
+  String Porta;
+  String Mqttuser;
+  String Mqttpass;
+  String MqttNomeAmigavel;
+  String MqttTopico;
+  String WebHookUrl;
+  String TempoParaDesligar;
+};
+
+Device dev;
+
+// =====================================================
+// OBJETOS
+// =====================================================
+
+ESP8266HTTPUpdateServer atualizadorOTA;
+ESP8266WebServer server(80);
+WiFiManager wfm;
+
+WiFiClient wifiClient;
+PubSubClient ConexaoMQTT(wifiClient);
+
+// =====================================================
+// CALLBACK SAVE CONFIG
+// =====================================================
+
+void saveConfigCallback()
+{
+  shouldSaveConfig = true;
+}
+
+// =====================================================
+// FS
+// =====================================================
+
+bool openFS(void)
+{
+  return SPIFFS.begin();
+}
+
+bool writeFile(String state, String path)
+{
+  File rFile = SPIFFS.open(path, "w+");
+  if(!rFile) return false;
+  rFile.println(state);
+  rFile.close();
+  return true;
+}
+
+bool appendFile(String state, String path)
+{
+  File rFile = SPIFFS.open(path, "a+");
+  if(!rFile) return false;
+  rFile.println(state);
+  rFile.close();
+  return true;
+}
+
+String readFile(String path)
+{
+  File rFile = SPIFFS.open(path, "r");
+  if(!rFile) return "";
+  String content = rFile.readStringUntil('\r');
+  rFile.close();
+  return content;
+}
+
+// =====================================================
+// CONFIG
+// =====================================================
+
+bool gravaConfigEx(String a, String b, String c, String d, String e, String f, String g, String h, String i)
+{
+  bool ok = true;
+  ok &= writeFile(a, ARQ_TEMP_SENSOR);
+  ok &= appendFile(b, ARQ_TEMP_SENSOR);
+  ok &= appendFile(c, ARQ_TEMP_SENSOR);
+  ok &= appendFile(d, ARQ_TEMP_SENSOR);
+  ok &= appendFile(e, ARQ_TEMP_SENSOR);
+  ok &= appendFile(f, ARQ_TEMP_SENSOR);
+  ok &= appendFile(g, ARQ_TEMP_SENSOR);
+  ok &= appendFile(h, ARQ_TEMP_SENSOR);
+  ok &= appendFile(i, ARQ_TEMP_SENSOR);
+
+  if (ok)
+  {
+    SPIFFS.remove(ARQ_SENSOR);
+    SPIFFS.rename(ARQ_TEMP_SENSOR, ARQ_SENSOR);
+  }
+
+  return ok;
+}
+
+void carregaConfigEx()
+{
+  if(!SPIFFS.exists(ARQ_SENSOR)) return;
+
+  File rFile = SPIFFS.open(ARQ_SENSOR, "r");
+  if (!rFile) return;
+
+  dev.Host              = rFile.readStringUntil('\n');
+  dev.IPMqtt            = rFile.readStringUntil('\n');
+  dev.Porta             = rFile.readStringUntil('\n');
+  dev.Mqttuser          = rFile.readStringUntil('\n');
+  dev.Mqttpass          = rFile.readStringUntil('\n');
+  dev.MqttNomeAmigavel  = rFile.readStringUntil('\n');
+  dev.MqttTopico        = rFile.readStringUntil('\n');
+  dev.WebHookUrl        = rFile.readStringUntil('\n');
+  dev.TempoParaDesligar = rFile.readStringUntil('\n');
+
+  dev.Host.trim();
+  dev.IPMqtt.trim();
+  dev.Porta.trim();
+  dev.Mqttuser.trim();
+  dev.Mqttpass.trim();
+  dev.MqttNomeAmigavel.trim();
+  dev.MqttTopico.trim();
+  dev.WebHookUrl.trim();
+  dev.TempoParaDesligar.trim();
+
+  rFile.close();
+}
+
+// =====================================================
+// WIFI
+// =====================================================
+
+void setupWiFiAuto()
+{
+  const char *ssid = SSID_NOME;
+  char tmp[40];
+  char ssidX[32 + 1];
+  char Host[33] = SSID_NOME;
+  char IPMqtt[256] = "127.0.0.1";
+  char Porta[7] = "1883";
+  char Mqttuser[65] = "mqtt";
+  char Mqttpass[65] = "mqtt";
+  char MqttNomeAmigavel[65] = TEXTO_ABERTURA;
+  char MqttTopico[65] = TEXTO_ABERTURA;
+  char WebHookUrl[65]= WEBHOOK_URL;
+  char TempoParaDesligar[2] = "1";
+
+  carregaConfigEx();
+
+  if (dev.Host.length()) dev.Host.toCharArray(Host, 33);
+  if (dev.IPMqtt.length()) dev.IPMqtt.toCharArray(IPMqtt, 256);
+  if (dev.Porta.length()) dev.Porta.toCharArray(Porta, 7);
+  if (dev.Mqttuser.length()) dev.Mqttuser.toCharArray(Mqttuser, 65);
+  if (dev.Mqttpass.length()) dev.Mqttpass.toCharArray(Mqttpass, 65);
+  if (dev.MqttNomeAmigavel.length()) dev.MqttNomeAmigavel.toCharArray(MqttNomeAmigavel, 65);
+  if (dev.MqttTopico.length()) dev.MqttTopico.toCharArray(MqttTopico, 65);
+  if (dev.WebHookUrl.length()) dev.WebHookUrl.toCharArray(WebHookUrl, 65);
+  if (dev.TempoParaDesligar.length()) dev.TempoParaDesligar.toCharArray(TempoParaDesligar, 2);
+
+  WiFiManagerParameter p1("host", "Host", Host, 32);
+  WiFiManagerParameter p2("IPMqtt", "IPMqtt", IPMqtt, 255);
+  WiFiManagerParameter p3("Porta", "Porta", Porta, 6);
+  WiFiManagerParameter p4("Mqttuser", "Mqttuser", Mqttuser, 64);
+  WiFiManagerParameter p5("Mqttpass", "Mqttpass", Mqttpass, 64);
+  WiFiManagerParameter p6("MqttNomeAmigavel", "MqttNomeAmigavel", MqttNomeAmigavel, 64);
+  WiFiManagerParameter p7("MqttTopico", "MqttTopico", MqttTopico, 64);
+  WiFiManagerParameter p8("WebHookUrl", "WebHookUrl", WebHookUrl, 64);
+  WiFiManagerParameter p9("TempoParaDesligar", "TempoParaDesligar", TempoParaDesligar, 1);
+
+  wfm.addParameter(&p1);
+  wfm.addParameter(&p2);
+  wfm.addParameter(&p3);
+  wfm.addParameter(&p4);
+  wfm.addParameter(&p5);
+  wfm.addParameter(&p6);
+  wfm.addParameter(&p7);
+  wfm.addParameter(&p8);
+  wfm.addParameter(&p9);
+
+  wfm.setSaveConfigCallback(saveConfigCallback);
+
+  strcpy(ssidX, ssid);
+  strcat(ssidX, "-");
+  WiFi.macAddress().toCharArray(tmp, 9);
+  strcat(ssidX, tmp);
+
+  if (!wfm.autoConnect(ssidX, PASS_NOME))
+    ESP.restart();
+
+  if (shouldSaveConfig)
+  {
+    gravaConfigEx(p1.getValue(), p2.getValue(), p3.getValue(), p4.getValue(), p5.getValue(), p6.getValue(), p7.getValue(), p8.getValue(), p9.getValue());
+    ESP.restart();
+  }
+}
+
+// =====================================================
+// MQTT (PADRÃO TASMOTA / HOME ASSISTANT)
+// =====================================================
+
+void PublicaEstadoMQTT()
+{
+  String topicoState = "esp8266/" + dev.MqttTopico + "/state";
+  ConexaoMQTT.publish(topicoState.c_str(), releLigado ? "ON" : "OFF", true);
+}
+
+void setRele(bool ligar)
+{
+  releLigado = ligar;
+  digitalWrite(PIN_RELE, ligar ? ON : OFF);
+  PublicaEstadoMQTT();
+}
+
+void executaWebhook()
+{    
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(3000);
+  http.begin(client, dev.WebHookUrl);
+  http.GET();
+  http.end();
+}
+
+void solicitaLigamento()
+{
+  desligamentoPendente = false;
+  setRele(true);
+}
+
+void solicitaDesligamento()
+{
+  unsigned long TempoParaDesligar = (dev.TempoParaDesligar.toInt() * MINUTO);
+  
+  if (!releLigado)
+    return;
+
+  desligamentoPendente = true;
+  horarioDesligamento = millis() + TempoParaDesligar;
+
+  executaWebhook();
+
+  String topicoState = "esp8266/" + dev.MqttTopico + "/state";
+  ConexaoMQTT.publish(topicoState.c_str(), "OFF", true);
+}
+
+void recebendoMensagensMQTT(char* topic, byte* payload, unsigned int length)
+{
+  String mensagem;
+  for (unsigned int i = 0; i < length; i++)
+    mensagem += (char)payload[i];
+
+  mensagem.trim();
+
+  if (mensagem == "ON")
+    mqttLiga = true;
+  else if (mensagem == "OFF")
+    mqttDesliga = true;
+}
+
+void RegistraSensorHA() {
+  String macStr = WiFi.macAddress();
+  macStr.replace(":", "");
+
+  String baseTopic = "esp8266/" + dev.MqttTopico;
+  String lwtTopic  = baseTopic + "/LWT";
+  String configTopic = "homeassistant/switch/" + macStr + "/config";
+
+  // Publica estado Online no LWT
+  ConexaoMQTT.publish(lwtTopic.c_str(), "Online", true);
+
+  // Payload formatado conforme padrao Tasmota/HA Discovery
+  String payload = "{";
+  payload += "\"name\":\"" + dev.MqttNomeAmigavel + "\",";
+  payload += "\"unique_id\":\"" + macStr + "_switch\",";
+  payload += "\"state_topic\":\"" + baseTopic + "/state\",";
+  payload += "\"command_topic\":\"" + baseTopic + "/set\",";
+  payload += "\"availability_topic\":\"" + lwtTopic + "\",";
+  payload += "\"payload_available\":\"Online\",";
+  payload += "\"payload_not_available\":\"Offline\",";
+  payload += "\"payload_on\":\"ON\",";
+  payload += "\"payload_off\":\"OFF\",";
+  payload += "\"icon\":\"mdi:power\",";
+  payload += "\"device\":{";
+  payload += "\"identifiers\":[\"" + macStr + "\"],";
+  payload += "\"name\":\"" + dev.MqttNomeAmigavel + "\",";
+  payload += "\"model\":\"ESP8266 Switch\",";
+  payload += "\"manufacturer\":\"T3X Custom\",";
+  payload += "\"sw_version\":\"" VERSAO "\"";
+  payload += "}";
+  payload += "}";
+
+  ConexaoMQTT.publish(configTopic.c_str(), payload.c_str(), true);
+}
+
+bool reconectaMQTT()
+{
+  if (ConexaoMQTT.connected())
+    return true;
+
+  ConexaoMQTT.setServer(dev.IPMqtt.c_str(), dev.Porta.toInt());
+  ConexaoMQTT.setCallback(recebendoMensagensMQTT);
+
+  String clientId = "esp8266-" + String(ESP.getChipId());
+  String lwtTopic = "esp8266/" + dev.MqttTopico + "/LWT";
+
+  // Conecta configurando o LWT (Last Will and Testament) para Offline caso perca conexão
+  if (ConexaoMQTT.connect(clientId.c_str(), dev.Mqttuser.c_str(), dev.Mqttpass.c_str(), lwtTopic.c_str(), 1, true, "Offline"))
+  {
+    String topicoComando = "esp8266/" + dev.MqttTopico + "/set";
+    ConexaoMQTT.subscribe(topicoComando.c_str());
+    RegistraSensorHA();
+    PublicaEstadoMQTT();
+    return true;
+  }
+
+  return false;
+}
+
+// =====================================================
+// WEB
+// =====================================================
+
+void handleRoot()
+{
+  char tmp[192];
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  String html = "<html><meta http-equiv='refresh' content='5'><body><pre>";
+
+  html += TEXTO_ABERTURA;
+  #ifdef ESP01
+      html += " - ESP-01/";
+  #else
+      html += " - ESP-8266/";
+  #endif
+  
+  html += ARDUINO_BOARD;
+  html += " v" VERSAO "\n\n";
+
+  html += "IP: " + WiFi.localIP().toString() + "\n";
+  html += "WebHook: " + dev.WebHookUrl + "\n";
+  html += "Espera: " + dev.TempoParaDesligar + "\n";
+
+  snprintf(tmp, sizeof(tmp),
+    "Data/Hora: %02d/%02d/%04d %02d:%02d:%02d",
+    t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
+    t.tm_hour, t.tm_min, t.tm_sec
+  );
+  html += tmp;
+  html += "\n\nEstado: ";
+
+  if (desligamentoPendente)
+    html += "DESLIGAMENTO_AGENDADO";
+  else
+    html += releLigado ? "ON" : "OFF";
+
+  html += "</pre></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleStatus()
+{
+  if (server.hasArg("rele"))
+  {
+    String valor = server.arg("rele");
+    valor.toUpperCase();
+
+    if (valor == "ON")
+      solicitaLigamento();
+    else if (valor == "OFF")
+    { 
+      if (server.hasArg("timer"))
+      {
+        String tempo = server.arg("timer");
+        unsigned long TempoParaDesligar = (tempo.toInt() * MINUTO);
+        solicitaDesligamento();
+        horarioDesligamento = millis() + TempoParaDesligar;
+      }
+      else
+      {
+        desligamentoPendente = false;
+        setRele(false);
+      }
+    }
+  }
+
+  if (desligamentoPendente)
+    server.send(200, "text/plain", "DESLIGAMENTO_AGENDADO");
+  else
+    server.send(200, "text/plain", releLigado ? "ON" : "OFF");
+}
+
+void handleStatusJson() {
+  char json[192];
+  String estado;
+
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+
+  if (desligamentoPendente)
+    estado = "DESLIGAMENTO_AGENDADO";
+  else
+    estado = releLigado ? "ON" : "OFF";
+
+  snprintf(json, sizeof(json),
+    "{\"estado\":\"%s\",\"DataHora\":\"%02d/%02d/%04d %02d:%02d:%02d\"}",
+    estado,
+    t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
+    t.tm_hour, t.tm_min, t.tm_sec
+  );
+
+  server.send(200, "application/json", json);
+}
+
+void handleReboot()
+{
+  server.send(200, "text/plain", "REBOOT");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleFactoryReset()
+{
+  server.send(200, "text/plain", "RESET DE FABRICA");
+  delay(1000);
+  wfm.resetSettings();
+  ESP.restart();
+}
+
+// =====================================================
+// BOTÃO
+// =====================================================
+
+void lerBotao()
+{
+  unsigned long tempoAtual = millis();
+
+  if (tempoAtual - ultimaLeituraBotao < 100)
+    return;
+
+  ultimaLeituraBotao = tempoAtual;
+
+  int leitura = digitalRead(PIN_BOTAO);
+
+  if (leitura != UltimoValor)
+  {
+    UltimoValor = leitura;
+
+    if (desligamentoPendente)
+      solicitaLigamento();
+    else if (releLigado)
+      solicitaDesligamento();
+    else
+      solicitaLigamento();
+
+    ultimoEnvioAutomatico = tempoAtual;
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(BAUD_RATE);
+  Serial.end();
+  
+  openFS();
+
+  setupWiFiAuto();
+
+  server.on("/",                     handleRoot);
+  server.on("/status",               handleStatus);
+  server.on("/reboot",               handleReboot);
+  server.on("/factoryreset",         handleFactoryReset);
+  server.on("/status/json",          handleStatusJson);
+
+  MDNS.begin(dev.Host);
+
+  atualizadorOTA.setup(&server);
+  server.begin();
+
+  MDNS.addService("http", "tcp", 80);
+
+  pinMode(PIN_BOTAO, INPUT_PULLUP);
+  pinMode(PIN_RELE, OUTPUT);
+
+  UltimoValor = digitalRead(PIN_BOTAO);
+  releLigado = true;
+  digitalWrite(PIN_RELE, ON);
+
+  reconectaMQTT();
+
+  solicitaLigamento();
+
+  configTime(UTC_OFFSET, UTC_OFFSET_DST, NTP_SERVER);
+  ultimaLeituraBotao = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  server.handleClient();
+  MDNS.update();
+
+  if (ConexaoMQTT.connected())
+  {
+    ConexaoMQTT.loop();
+  }
+  else
+  {
+    static unsigned long ultimoReconectar = 0;
+    if (millis() - ultimoReconectar > 5000)
+    {
+      ultimoReconectar = millis();
+      reconectaMQTT();
+    }
+  }
+  
+  // MQTT ON
+  if (mqttLiga)
+  {
+    mqttLiga = false;
+    solicitaLigamento();
+  }
+
+  // MQTT OFF
+  if (mqttDesliga)
+  {
+    mqttDesliga = false;
+    solicitaDesligamento();
+  }
+
+  // DESLIGAMENTO PROGRAMADO
+  if (desligamentoPendente && millis() >= horarioDesligamento)
+  {
+    desligamentoPendente = false;
+    setRele(false);
+  }
+
+  lerBotao();
+  yield();
+}
+

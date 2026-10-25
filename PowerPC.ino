@@ -1,0 +1,1528 @@
+
+// "Ad Astra Per Aspera"
+// "Por asperos caminhos até as Estrelas"
+// "Para as estrelas através das dificuldades"
+
+// ===================================================================== CLAUDE
+// PowerPC - controle de energia de PC (ESP8266 / ESP-01)
+// Compatível com Home Assistant como se fosse um Tasmota.
+//
+// MQTT (Tasmota):   <topico> = campo "MqttTopico" do portal de configuração
+//   cmnd/<topico>/POWER | POWER1   ON, OFF, TOGGLE (sem payload = consulta)
+//   cmnd/<topico>/STATE            publica tele/<topico>/STATE
+//   cmnd/<topico>/STATUS [0|2|5|11]
+//   cmnd/<topico>/TELEPERIOD [0|10..3600]
+//   cmnd/<topico>/RESTART 1
+//   cmnd/tasmotas/<comando>        tópico de grupo (todos os aparelhos)
+//   stat/<topico>/POWER            ON/OFF (retido)
+//   stat/<topico>/RESULT           {"POWER":"ON"}
+//   tele/<topico>/LWT              Online / Offline (retido)
+//   tele/<topico>/STATE            JSON de estado (a cada TelePeriod)
+//   tasmota/discovery/<MAC>/config descoberta automática no Home Assistant
+//
+// MQTT (legado, mantido): esp8266/<topico>/set  e  esp8266/<topico>/state
+//
+// HTTP: /  /status  /status/json  /reboot  /factoryreset  /update (OTA)
+//       /cm?cmnd=Power%20On   (API de comandos igual à do Tasmota)
+//
+// "OFF" (MQTT, botão, Home Assistant) = desligamento agendado: chama o
+// WebHook e só corta o relé depois de "TempoParaDesligar" minutos.
+// =====================================================================
+
+#include <Arduino.h>
+
+#ifndef ESP8266
+  #error "Este sketch é para ESP8266 (ESP-01 / NodeMCU / ESP8266_GENERIC)."
+#endif
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <ESP8266mDNS.h>
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <FS.h>
+#include <time.h>
+
+// =====================================================
+// CONSTANTES
+// =====================================================
+
+#define BAUD_RATE         115200
+
+#define SEGUNDO           (1000UL)
+#define MINUTO            (60UL * SEGUNDO)
+
+// WEBHOOK
+#define WEBHOOK_URL "http://192.168.2.31:8081/shutdown"  - PowerPC-NAS-RPI5
+#define WEBHOOK_URL "http://192.168.2.200:8081/shutdown" - PowerPC-Icarus
+
+// =====================================================
+// CONFIG
+// =====================================================
+
+#define ARQ_SENSOR        "/sensor.conf"
+#define ARQ_TEMP_SENSOR   "/sensor.temp"
+
+#define TEXTO_ABERTURA    "PowerPC"
+#define VERSAO            "1.20"
+
+#define SSID_NOME         "PowerPC"
+#define PASS_NOME         ""
+
+// =====================================================
+// HOME ASSISTANT / TASMOTA
+// =====================================================
+
+// 0 = sem discovery
+// 1 = discovery nativo do Tasmota (integração "Tasmota" do Home Assistant)
+// 2 = MQTT Discovery padrão do HA (entidade "switch" usando os tópicos Tasmota)
+#define DISCOVERY_MODO          1
+
+// mantém os tópicos antigos esp8266/<topico>/set e esp8266/<topico>/state
+#define MQTT_LEGADO             1
+
+// apaga do broker a entidade antiga homeassistant/switch/esp8266/<topico>/config
+// (evita entidade duplicada no HA)
+#define LIMPA_DISCOVERY_LEGADO  1
+
+#define TELE_PERIODO_PADRAO     300     // segundos (igual ao Tasmota)
+#define TOPICO_GRUPO            "tasmotas"
+#define MQTT_BUFFER             1536
+
+// =====================================================
+// PINOS NODEMCU
+// =====================================================
+
+#define PIN_D0    16
+#define PIN_D1     5
+#define PIN_D2     4
+#define PIN_D3     0
+#define PIN_D4     2
+#define PIN_D5    14
+#define PIN_D6    12
+#define PIN_D7    13
+#define PIN_D8    15
+
+// =====================================================
+// ESP-01
+// =====================================================
+
+#define GPIO0 0
+#define TX    1
+#define GPIO2 2
+#define RX    3
+
+// o interruptor do PC deve estar ligado no "Normalmente fechado"
+
+// RPI5   --> RELE_NORMAL e ESP12-Module 0.9                 (esp8266.esp8266.nodemcu)
+// icarus --> RELE_NORMAL desligado e ESP01 ESP8266_GENERIC  (esp8266.esp8266.generic)
+
+//#define RELE_NORMAL
+#define ESP01 // ESP8266_GENERIC
+
+#ifdef ESP01
+  #define PIN_BOTAO       GPIO0
+  #define PIN_RELE        RX
+  #define PIN_BOTAO_RESET 0xff // não tem reset fisico
+#else
+  #define PIN_BOTAO        PIN_D0
+  #define PIN_RELE         PIN_D1
+  #define PIN_BOTAO_RESET  PIN_D8
+#endif
+
+// o interruptor do PC deve estar ligado no "Normalmente fechado"
+#ifdef  RELE_NORMAL // Rele Normal
+  #define NIVEL_ON    LOW
+  #define NIVEL_OFF   HIGH
+#else               // Rele Invertido
+  #define NIVEL_ON    HIGH
+  #define NIVEL_OFF   LOW
+#endif
+
+#define NTP_SERVER     "pool.ntp.org"
+#define UTC_OFFSET     (-3 * 3600)
+#define UTC_OFFSET_DST 0
+
+// =====================================================
+// VARIÁVEIS
+// =====================================================
+
+unsigned long ultimaLeituraBotao  = 0;
+unsigned long horarioDesligamento = 0;
+unsigned long tempoBotaoReset     = 0;
+unsigned long ultimoTele          = 0;
+unsigned long ultimaTentativaMqtt = 0;
+unsigned long intervaloMqtt       = 0;
+unsigned long reiniciarEm         = 0;
+unsigned long telePeriodo         = TELE_PERIODO_PADRAO;   // segundos
+
+bool desligamentoPendente = false;
+bool releLigado           = false;
+bool shouldSaveConfig     = false;
+bool reiniciarPendente    = false;
+bool cmdPendente          = false;
+
+uint32_t contadorMqtt = 0;
+
+int UltimoValor = 0xff;
+
+String cmdPend;
+String argPend;
+
+// =====================================================
+// DEVICE
+// =====================================================
+
+struct Device
+{
+  String Host;
+  String IPMqtt;
+  String Porta;
+  String Mqttuser;
+  String Mqttpass;
+  String MqttNomeAmigavel;
+  String MqttTopico;
+  String WebHookUrl;
+  String TempoParaDesligar;
+  String TelePeriod;
+};
+
+Device dev;
+
+// tópicos e identificadores (montados em montaTopicos)
+String tCmnd;      // cmnd/<topico>/
+String tStat;      // stat/<topico>/
+String tTele;      // tele/<topico>/
+String tGrupo;     // cmnd/tasmotas/
+String tLegado;    // esp8266/<topico>
+String idMac;      // AABBCCDDEEFF
+String idCliente;  // DVES_XXXXXX
+
+// =====================================================
+// OBJETOS
+// =====================================================
+
+ESP8266HTTPUpdateServer atualizadorOTA;
+ESP8266WebServer server(80);
+WiFiManager wfm;
+
+WiFiClient wifiClient;
+PubSubClient ConexaoMQTT(wifiClient);
+
+// =====================================================
+// UTILITÁRIOS
+// =====================================================
+
+String jsonEsc(const String &in)
+{
+  String o;
+  o.reserve(in.length() + 4);
+
+  for (unsigned int i = 0; i < in.length(); i++)
+  {
+    char c = in[i];
+
+    if (c == '"' || c == '\\')
+    {
+      o += '\\';
+      o += c;
+    }
+    else if ((unsigned char)c < 0x20)
+      o += ' ';
+    else
+      o += c;
+  }
+
+  return o;
+}
+
+String htmlEsc(String s)
+{
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  return s;
+}
+
+String sanitizaTopico(String s)
+{
+  s.trim();
+
+  for (unsigned int i = 0; i < s.length(); i++)
+  {
+    char c = s[i];
+
+    if (c == '/' || c == '#' || c == '+' || c == ' ' || c == '%' || c == '"' || c == '\\' || (unsigned char)c < 0x20)
+      s.setCharAt(i, '_');
+  }
+
+  return s;
+}
+
+bool ehNumero(const String &s)
+{
+  if (!s.length())
+    return false;
+
+  for (unsigned int i = 0; i < s.length(); i++)
+    if (s[i] < '0' || s[i] > '9')
+      return false;
+
+  return true;
+}
+
+void repete(String &s, const char *item, uint8_t n)
+{
+  while (n--)
+    s += item;
+}
+
+// remove as chaves externas: {"A":1} -> "A":1
+String semChaves(const String &s)
+{
+  if (s.length() < 2)
+    return "";
+
+  return s.substring(1, s.length() - 1);
+}
+
+// tempo ligado em ms sem estourar a cada 49 dias (precisa ser chamado no loop)
+uint64_t uptimeMs()
+{
+  static unsigned long anterior = 0;
+  static uint64_t acumulado = 0;
+
+  unsigned long agora = millis();
+  acumulado += (unsigned long)(agora - anterior);
+  anterior = agora;
+
+  return acumulado;
+}
+
+String textoUptime()
+{
+  unsigned long s = (unsigned long)(uptimeMs() / 1000ULL);
+  char b[24];
+
+  snprintf(b, sizeof(b), "%luT%02lu:%02lu:%02lu", s / 86400UL, (s / 3600UL) % 24UL, (s / 60UL) % 60UL, s % 60UL);
+
+  return String(b);
+}
+
+String textoHoraISO()
+{
+  time_t now = time(nullptr);
+  struct tm t;
+  char b[24];
+
+  localtime_r(&now, &t);
+  strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%S", &t);
+
+  return String(b);
+}
+
+String textoDataHoraBR()
+{
+  time_t now = time(nullptr);
+  struct tm t;
+  char b[48];
+
+  localtime_r(&now, &t);
+
+  snprintf(b, sizeof(b), "%02d/%02d/%04d %02d:%02d:%02d",
+    t.tm_mday,
+    t.tm_mon + 1,
+    t.tm_year + 1900,
+    t.tm_hour,
+    t.tm_min,
+    t.tm_sec
+  );
+
+  return String(b);
+}
+
+const char *modoWifi()
+{
+  switch (WiFi.getPhyMode())
+  {
+    case WIFI_PHY_MODE_11B: return "11b";
+    case WIFI_PHY_MODE_11G: return "11g";
+    default:                return "11n";
+  }
+}
+
+// =====================================================
+// CALLBACK SAVE CONFIG
+// =====================================================
+
+void saveConfigCallback()
+{
+  shouldSaveConfig = true;
+}
+
+// =====================================================
+// FS
+// =====================================================
+
+bool openFS(void)
+{
+  return SPIFFS.begin();
+}
+
+bool writeFile(String state, String path)
+{
+  File rFile = SPIFFS.open(path, "w+");
+
+  if(!rFile)
+    return false;
+
+  rFile.println(state);
+
+  rFile.close();
+
+  return true;
+}
+
+bool appendFile(String state, String path)
+{
+  File rFile = SPIFFS.open(path, "a+");
+
+  if(!rFile)
+    return false;
+
+  rFile.println(state);
+
+  rFile.close();
+
+  return true;
+}
+
+String readFile(String path)
+{
+  File rFile = SPIFFS.open(path, "r");
+
+  if(!rFile)
+    return "";
+
+  String content = rFile.readStringUntil('\r');
+
+  rFile.close();
+
+  return content;
+}
+
+// =====================================================
+// CONFIG
+// =====================================================
+
+#define NUM_CAMPOS_CONFIG 10
+
+// formato do arquivo: uma linha por campo, na ordem abaixo.
+// O 10º campo (TelePeriod) é novo; arquivos antigos com 9 linhas continuam válidos.
+bool gravaConfig()
+{
+  const String *campos[NUM_CAMPOS_CONFIG] =
+  {
+    &dev.Host, &dev.IPMqtt, &dev.Porta, &dev.Mqttuser, &dev.Mqttpass,
+    &dev.MqttNomeAmigavel, &dev.MqttTopico, &dev.WebHookUrl,
+    &dev.TempoParaDesligar, &dev.TelePeriod
+  };
+
+  bool ok = writeFile(*campos[0], ARQ_TEMP_SENSOR);
+
+  for (int i = 1; i < NUM_CAMPOS_CONFIG; i++)
+    ok &= appendFile(*campos[i], ARQ_TEMP_SENSOR);
+
+  if (ok)
+  {
+    SPIFFS.remove(ARQ_SENSOR);
+    SPIFFS.rename(ARQ_TEMP_SENSOR, ARQ_SENSOR);
+  }
+
+  return ok;
+}
+
+void carregaConfigEx()
+{
+  if(!SPIFFS.exists(ARQ_SENSOR))
+    return;
+
+  File rFile = SPIFFS.open(ARQ_SENSOR, "r");
+
+  if (!rFile)
+    return;
+
+  dev.Host              = rFile.readStringUntil('\n');
+  dev.IPMqtt            = rFile.readStringUntil('\n');
+  dev.Porta             = rFile.readStringUntil('\n');
+  dev.Mqttuser          = rFile.readStringUntil('\n');
+  dev.Mqttpass          = rFile.readStringUntil('\n');
+  dev.MqttNomeAmigavel  = rFile.readStringUntil('\n');
+  dev.MqttTopico        = rFile.readStringUntil('\n');
+  dev.WebHookUrl        = rFile.readStringUntil('\n');
+  dev.TempoParaDesligar = rFile.readStringUntil('\n');
+  dev.TelePeriod        = rFile.readStringUntil('\n');
+
+  dev.Host.trim();
+  dev.IPMqtt.trim();
+  dev.Porta.trim();
+  dev.Mqttuser.trim();
+  dev.Mqttpass.trim();
+  dev.MqttNomeAmigavel.trim();
+  dev.MqttTopico.trim();
+  dev.WebHookUrl.trim();
+  dev.TempoParaDesligar.trim();
+  dev.TelePeriod.trim();
+
+  rFile.close();
+}
+
+// Completa o que estiver vazio. Antes, sem arquivo de configuração (ex.: Wi-Fi já
+// salvo por outro firmware) o tópico ficava vazio e o MQTT usava "esp8266//set".
+void aplicaPadroes(bool temArquivo)
+{
+  if (!dev.Host.length())              dev.Host              = SSID_NOME;
+  if (!dev.IPMqtt.length())            dev.IPMqtt            = "127.0.0.1";
+  if (!dev.Porta.length())             dev.Porta             = "1883";
+  if (!dev.MqttNomeAmigavel.length())  dev.MqttNomeAmigavel  = TEXTO_ABERTURA;
+  if (!dev.MqttTopico.length())        dev.MqttTopico        = TEXTO_ABERTURA;
+  if (!dev.WebHookUrl.length())        dev.WebHookUrl        = WEBHOOK_URL;
+  if (!dev.TempoParaDesligar.length()) dev.TempoParaDesligar = "1";
+  if (!dev.TelePeriod.length())        dev.TelePeriod        = String(TELE_PERIODO_PADRAO);
+
+  // usuário/senha vazios num arquivo existente = broker sem autenticação
+  if (!temArquivo)
+  {
+    dev.Mqttuser = "mqtt";
+    dev.Mqttpass = "mqtt";
+  }
+
+  dev.MqttTopico = sanitizaTopico(dev.MqttTopico);
+
+  if (!dev.MqttTopico.length())
+    dev.MqttTopico = TEXTO_ABERTURA;
+
+  long tp = ehNumero(dev.TelePeriod) ? dev.TelePeriod.toInt() : TELE_PERIODO_PADRAO;
+
+  if (tp != 0 && (tp < 10 || tp > 3600))
+    tp = TELE_PERIODO_PADRAO;
+
+  telePeriodo = (unsigned long)tp;
+  dev.TelePeriod = String(tp);
+}
+
+void montaTopicos()
+{
+  char cid[16];
+
+  idMac = WiFi.macAddress();
+  idMac.replace(":", "");
+  idMac.toUpperCase();
+
+  snprintf(cid, sizeof(cid), "DVES_%06X", (unsigned int)ESP.getChipId());
+  idCliente = cid;
+
+  tCmnd   = String("cmnd/") + dev.MqttTopico + "/";
+  tStat   = String("stat/") + dev.MqttTopico + "/";
+  tTele   = String("tele/") + dev.MqttTopico + "/";
+  tGrupo  = String("cmnd/" TOPICO_GRUPO "/");
+  tLegado = String("esp8266/") + dev.MqttTopico;
+}
+
+// =====================================================
+// WIFI
+// =====================================================
+
+void setupWiFiAuto()
+{
+  char ssidX[40];                // Para o AP para a configuração inicial
+  char Host[33];
+  char IPMqtt[256];
+  char Porta[7];
+  char Mqttuser[65];
+  char Mqttpass[65];
+  char MqttNomeAmigavel[65];
+  char MqttTopico[65];
+  char WebHookUrl[129];
+  char TempoParaDesligar[4];
+  char TelePeriod[5];
+
+  bool temArquivo = SPIFFS.exists(ARQ_SENSOR);
+
+  carregaConfigEx();
+  aplicaPadroes(temArquivo);
+
+  dev.Host.toCharArray(Host, sizeof(Host));
+  dev.IPMqtt.toCharArray(IPMqtt, sizeof(IPMqtt));
+  dev.Porta.toCharArray(Porta, sizeof(Porta));
+  dev.Mqttuser.toCharArray(Mqttuser, sizeof(Mqttuser));
+  dev.Mqttpass.toCharArray(Mqttpass, sizeof(Mqttpass));
+  dev.MqttNomeAmigavel.toCharArray(MqttNomeAmigavel, sizeof(MqttNomeAmigavel));
+  dev.MqttTopico.toCharArray(MqttTopico, sizeof(MqttTopico));
+  dev.WebHookUrl.toCharArray(WebHookUrl, sizeof(WebHookUrl));
+  dev.TempoParaDesligar.toCharArray(TempoParaDesligar, sizeof(TempoParaDesligar));
+  dev.TelePeriod.toCharArray(TelePeriod, sizeof(TelePeriod));
+
+  WiFi.hostname(dev.Host);
+
+  static WiFiManagerParameter p1("host", "Host", Host, 32);
+  static WiFiManagerParameter p2("IPMqtt", "IPMqtt", IPMqtt, 255);
+  static WiFiManagerParameter p3("Porta", "Porta", Porta, 6);
+  static WiFiManagerParameter p4("Mqttuser", "Mqttuser", Mqttuser, 64);
+  static WiFiManagerParameter p5("Mqttpass", "Mqttpass", Mqttpass, 64);
+  static WiFiManagerParameter p6("MqttNomeAmigavel", "MqttNomeAmigavel", MqttNomeAmigavel, 64);
+  static WiFiManagerParameter p7("MqttTopico", "MqttTopico", MqttTopico, 64);
+  static WiFiManagerParameter p8("WebHookUrl", "WebHookUrl", WebHookUrl, 128);
+  static WiFiManagerParameter p9("TempoParaDesligar", "TempoParaDesligar (min)", TempoParaDesligar, 3);
+  static WiFiManagerParameter p10("TelePeriod", "TelePeriod (s)", TelePeriod, 4);
+
+  wfm.addParameter(&p1);
+  wfm.addParameter(&p2);
+  wfm.addParameter(&p3);
+  wfm.addParameter(&p4);
+  wfm.addParameter(&p5);
+  wfm.addParameter(&p6);
+  wfm.addParameter(&p7);
+  wfm.addParameter(&p8);
+  wfm.addParameter(&p9);
+  wfm.addParameter(&p10);
+
+  wfm.setSaveConfigCallback(saveConfigCallback);
+
+  // Sem isso, uma queda do roteador deixava o aparelho preso no portal para sempre.
+  // Agora o portal fecha após 3 min sem ninguém conectado e o aparelho reinicia e tenta de novo.
+  wfm.setConfigPortalTimeout(180);
+  wfm.setAPClientCheck(true);
+
+  snprintf(ssidX, sizeof(ssidX), "%s-%06X", SSID_NOME, (unsigned int)ESP.getChipId());
+
+  if (!wfm.autoConnect(ssidX, PASS_NOME))
+    ESP.restart();
+
+  if (shouldSaveConfig)
+  {
+    dev.Host              = p1.getValue();
+    dev.IPMqtt            = p2.getValue();
+    dev.Porta             = p3.getValue();
+    dev.Mqttuser          = p4.getValue();
+    dev.Mqttpass          = p5.getValue();
+    dev.MqttNomeAmigavel  = p6.getValue();
+    dev.MqttTopico        = p7.getValue();
+    dev.WebHookUrl        = p8.getValue();
+    dev.TempoParaDesligar = p9.getValue();
+    dev.TelePeriod        = p10.getValue();
+
+    gravaConfig();
+    ESP.restart();
+  }
+}
+
+// =====================================================
+// MQTT - PUBLICAÇÃO
+// =====================================================
+
+bool mqttPub(const String &topico, const String &payload, bool retido)
+{
+  if (!ConexaoMQTT.connected())
+    return false;
+
+  return ConexaoMQTT.publish(topico.c_str(), payload.c_str(), retido);
+}
+
+// o que o Home Assistant enxerga: durante o desligamento agendado o estado já é OFF
+const char *textoPower()
+{
+  return (releLigado && !desligamentoPendente) ? "ON" : "OFF";
+}
+
+// o que as páginas web mostram
+const char *textoEstadoInterno()
+{
+  if (desligamentoPendente)
+    return "DESLIGAMENTO_AGENDADO";
+
+  return releLigado ? "ON" : "OFF";
+}
+
+String jsonPower()
+{
+  String s = F("{\"POWER\":\"");
+  s += textoPower();
+  s += F("\"}");
+  return s;
+}
+
+void publicaPower()
+{
+  mqttPub(tStat + "POWER", textoPower(), true);
+  mqttPub(tStat + "RESULT", jsonPower(), false);
+
+#if MQTT_LEGADO
+  mqttPub(tLegado + "/state", textoPower(), true);
+#endif
+}
+
+String jsonEstado()
+{
+  int rssi = WiFi.RSSI();
+  int qualidade = 2 * (rssi + 100);   // Tasmota mostra RSSI em % e Signal em dBm
+  long restante = 0;
+
+  if (qualidade < 0)   qualidade = 0;
+  if (qualidade > 100) qualidade = 100;
+
+  if (desligamentoPendente)
+  {
+    long r = (long)(horarioDesligamento - millis());
+    restante = (r > 0) ? r / 1000L : 0;
+  }
+
+  String s;
+  s.reserve(460);
+
+  s  = F("{\"Time\":\"");            s += textoHoraISO();
+  s += F("\",\"Uptime\":\"");        s += textoUptime();
+  s += F("\",\"UptimeSec\":");       s += (unsigned long)(uptimeMs() / 1000ULL);
+  s += F(",\"Heap\":");              s += (unsigned long)(ESP.getFreeHeap() / 1024UL);
+  s += F(",\"MqttCount\":");         s += (unsigned long)contadorMqtt;
+  s += F(",\"POWER\":\"");           s += textoPower();
+  s += F("\",\"ShutdownPending\":"); s += desligamentoPendente ? "true" : "false";
+  s += F(",\"ShutdownRemaining\":"); s += restante;
+  s += F(",\"Wifi\":{\"AP\":1,\"SSId\":\"");  s += jsonEsc(WiFi.SSID());
+  s += F("\",\"BSSId\":\"");         s += WiFi.BSSIDstr();
+  s += F("\",\"Channel\":");         s += (long)WiFi.channel();
+  s += F(",\"Mode\":\"");            s += modoWifi();
+  s += F("\",\"RSSI\":");            s += qualidade;
+  s += F(",\"Signal\":");            s += rssi;
+  s += F(",\"LinkCount\":1,\"Downtime\":\"0T00:00:00\"}}");
+
+  return s;
+}
+
+void publicaTele()
+{
+  ultimoTele = millis();
+
+  mqttPub(tTele + "STATE", jsonEstado(), false);
+
+#if MQTT_LEGADO
+  mqttPub(tLegado + "/state", textoPower(), true);   // renova o estado legado
+#endif
+}
+
+void publicaInfo()
+{
+  String s;
+
+  s  = F("{\"Info1\":{\"Module\":\"" TEXTO_ABERTURA " ESP8266\",\"Version\":\"" VERSAO "\",\"FallbackTopic\":\"cmnd/");
+  s += idCliente;
+  s += F("_fb/\",\"GroupTopic\":\"cmnd/" TOPICO_GRUPO "/\"}}");
+  mqttPub(tTele + "INFO1", s, false);
+
+  s  = F("{\"Info2\":{\"WebServerMode\":\"Admin\",\"Hostname\":\"");
+  s += jsonEsc(dev.Host);
+  s += F("\",\"IPAddress\":\"");
+  s += WiFi.localIP().toString();
+  s += F("\"}}");
+  mqttPub(tTele + "INFO2", s, false);
+
+  s  = F("{\"Info3\":{\"RestartReason\":\"");
+  s += jsonEsc(ESP.getResetReason());
+  s += F("\"}}");
+  mqttPub(tTele + "INFO3", s, false);
+}
+
+// =====================================================
+// DISCOVERY (Home Assistant)
+// =====================================================
+
+#if DISCOVERY_MODO == 1
+// Formato idêntico ao do firmware Tasmota (xdrv_12_discovery.ino).
+// A integração "Tasmota" do HA cria o dispositivo e o switch sozinha.
+void publicaDiscoveryTasmota()
+{
+  String nome = jsonEsc(dev.MqttNomeAmigavel);
+  String j;
+  j.reserve(1000);
+
+  j  = F("{\"ip\":\"");              j += WiFi.localIP().toString();
+  j += F("\",\"dn\":\"");            j += nome;
+  j += F("\",\"fn\":[\"");           j += nome; j += '"'; repete(j, ",null", 7);
+  j += F("],\"hn\":\"");             j += jsonEsc(dev.Host);
+  j += F("\",\"mac\":\"");           j += idMac;
+  j += F("\",\"md\":\"");            j += TEXTO_ABERTURA; j += F(" ESP8266");
+  j += F("\",\"ty\":0,\"if\":0,\"cam\":0,\"ofln\":\"Offline\",\"onln\":\"Online\"");
+  j += F(",\"state\":[\"OFF\",\"ON\",\"TOGGLE\",\"HOLD\"],\"sw\":\"");  j += VERSAO;
+  j += F("\",\"t\":\"");             j += dev.MqttTopico;
+  j += F("\",\"ft\":\"%prefix%/%topic%/\",\"tp\":[\"cmnd\",\"stat\",\"tele\"]");
+  j += F(",\"rl\":[1");              repete(j, ",0", 7);
+  j += F("],\"swc\":[-1");           repete(j, ",-1", 7);
+  j += F("],\"swn\":[null");         repete(j, ",null", 7);
+  j += F("],\"btn\":[0");            repete(j, ",0", 7);
+  j += F("],\"so\":{\"4\":0,\"11\":0,\"13\":0,\"17\":0,\"20\":0,\"30\":0,\"68\":0,\"73\":0,\"82\":0,\"114\":0,\"117\":0}");
+  j += F(",\"lk\":1,\"lt_st\":0,\"bat\":0,\"dslp\":0,\"sho\":[],\"sht\":[],\"ver\":1}");
+
+  mqttPub(String("tasmota/discovery/") + idMac + "/config", j, true);
+
+  String s = F("{\"sn\":{\"Time\":\"");
+  s += textoHoraISO();
+  s += F("\"},\"ver\":1}");
+
+  mqttPub(String("tasmota/discovery/") + idMac + "/sensors", s, true);
+}
+#endif
+
+#if DISCOVERY_MODO == 2
+// MQTT Discovery padrão do HA, sem precisar da integração Tasmota.
+void publicaDiscoveryHA()
+{
+  String nome = jsonEsc(dev.MqttNomeAmigavel);
+  String j;
+  j.reserve(700);
+
+  j  = F("{\"name\":\"");           j += nome;
+  j += F("\",\"uniq_id\":\"");      j += idMac; j += F("_relay");
+  j += F("\",\"cmd_t\":\"");        j += tCmnd; j += F("POWER");
+  j += F("\",\"stat_t\":\"");       j += tStat; j += F("POWER");
+  j += F("\",\"avty_t\":\"");       j += tTele; j += F("LWT");
+  j += F("\",\"pl_avail\":\"Online\",\"pl_not_avail\":\"Offline\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"");
+  j += F(",\"icon\":\"mdi:power\",\"dev\":{\"ids\":[\"");  j += idMac;
+  j += F("\"],\"name\":\"");        j += nome;
+  j += F("\",\"mdl\":\"" TEXTO_ABERTURA " ESP8266\",\"sw\":\"" VERSAO "\"}}");
+
+  mqttPub(String("homeassistant/switch/") + idMac + "_relay/config", j, true);
+}
+#endif
+
+void publicaDiscovery()
+{
+#if DISCOVERY_MODO != 0
+  #if LIMPA_DISCOVERY_LEGADO
+    // payload vazio + retido = apaga a entidade antiga no broker
+    mqttPub(String("homeassistant/switch/") + tLegado + "/config", "", true);
+  #endif
+#endif
+
+#if DISCOVERY_MODO == 1
+  publicaDiscoveryTasmota();
+#elif DISCOVERY_MODO == 2
+  publicaDiscoveryHA();
+#endif
+}
+
+// =====================================================
+// RELÉ / DESLIGAMENTO
+// =====================================================
+
+void setRele(bool ligar)
+{
+  releLigado = ligar;
+  digitalWrite(PIN_RELE, ligar ? NIVEL_ON : NIVEL_OFF);
+  publicaPower();
+}
+
+void executaWebhook()
+{
+  if (!dev.WebHookUrl.length() || WiFi.status() != WL_CONNECTED)
+    return;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(3000);
+
+  if (http.begin(client, dev.WebHookUrl)) // WEBHOOK_URL
+  {
+    http.GET();
+    http.end();
+  }
+}
+
+void solicitaLigamento()
+{
+  desligamentoPendente = false;
+  setRele(true);
+}
+
+// minutos < 0 = usa "TempoParaDesligar" da configuração
+void solicitaDesligamento(long minutos)
+{
+  if (!releLigado || desligamentoPendente)   // já desligado ou já agendado: só ressincroniza o estado
+  {
+    publicaPower();
+    return;
+  }
+
+  if (minutos < 0)
+    minutos = dev.TempoParaDesligar.toInt();
+
+  if (minutos < 0)
+    minutos = 0;
+
+  desligamentoPendente = true;
+
+  executaWebhook();
+
+  horarioDesligamento = millis() + (unsigned long)minutos * MINUTO;
+
+  publicaPower();   // o Home Assistant passa a ver OFF imediatamente
+}
+
+void alternaRele()
+{
+  if (desligamentoPendente)
+    solicitaLigamento();
+  else if (releLigado)
+    solicitaDesligamento(-1);
+  else
+    solicitaLigamento();
+}
+
+void verificaDesligamentoPendente()
+{
+  // comparação com sinal: continua correta quando o millis() dá a volta
+  if (desligamentoPendente && (long)(millis() - horarioDesligamento) >= 0)
+  {
+    desligamentoPendente = false;
+    setRele(false);
+  }
+}
+
+void agendaReinicio()
+{
+  reiniciarPendente = true;
+  reiniciarEm = millis() + 1000UL;
+}
+
+void finalizaMQTT()
+{
+  if (ConexaoMQTT.connected())
+  {
+    mqttPub(tTele + "LWT", "Offline", true);
+    ConexaoMQTT.disconnect();
+  }
+}
+
+// =====================================================
+// COMANDOS (iguais aos do Tasmota)
+// =====================================================
+
+int interpretaAcao(String a)
+{
+  a.trim();
+  a.toUpperCase();
+
+  if (a == "ON"  || a == "1" || a == "TRUE")  return 1;
+  if (a == "OFF" || a == "0" || a == "FALSE") return 0;
+  if (a == "TOGGLE" || a == "2")              return 2;
+
+  return -1;
+}
+
+String jsonStatus()
+{
+  String nome = jsonEsc(dev.MqttNomeAmigavel);
+  String s;
+
+  s  = F("{\"Status\":{\"Module\":18,\"DeviceName\":\"");  s += nome;
+  s += F("\",\"FriendlyName\":[\"");                        s += nome;
+  s += F("\"],\"Topic\":\"");                               s += dev.MqttTopico;
+  s += F("\",\"ButtonTopic\":\"0\",\"Power\":\"");          s += releLigado ? "1" : "0";
+  s += F("\",\"PowerOnState\":1,\"PowerRetain\":1}}");
+
+  return s;
+}
+
+String jsonStatusFWR()
+{
+  String s;
+
+  s  = F("{\"StatusFWR\":{\"Version\":\"" VERSAO "\",\"BuildDateTime\":\"" __DATE__ " " __TIME__ "\",\"Core\":\"");
+  s += jsonEsc(ESP.getCoreVersion());
+  s += F("\",\"SDK\":\"");
+  s += jsonEsc(String(ESP.getSdkVersion()));
+  s += F("\",\"Hardware\":\"ESP8266EX\"}}");
+
+  return s;
+}
+
+String jsonStatusNET()
+{
+  String s;
+
+  s  = F("{\"StatusNET\":{\"Hostname\":\"");  s += jsonEsc(dev.Host);
+  s += F("\",\"IPAddress\":\"");              s += WiFi.localIP().toString();
+  s += F("\",\"Gateway\":\"");                s += WiFi.gatewayIP().toString();
+  s += F("\",\"Subnetmask\":\"");             s += WiFi.subnetMask().toString();
+  s += F("\",\"DNSServer\":\"");              s += WiFi.dnsIP().toString();
+  s += F("\",\"Mac\":\"");                    s += WiFi.macAddress();
+  s += F("\"}}");
+
+  return s;
+}
+
+String jsonStatusSTS()
+{
+  String s = F("{\"StatusSTS\":");
+  s += jsonEstado();
+  s += F("}");
+
+  return s;
+}
+
+// STATUS (sem argumento), STATUS 0 (tudo), 2, 5 e 11. Responde em stat/<topico>/STATUS<n>.
+String comandoStatus(const String &arg, bool viaMqtt)
+{
+  long n = ehNumero(arg) ? arg.toInt() : -1;
+  String r;
+
+  if (n == 0)
+  {
+    String a = jsonStatus();
+    String b = jsonStatusFWR();
+    String c = jsonStatusNET();
+    String d = jsonStatusSTS();
+
+    if (viaMqtt)
+    {
+      mqttPub(tStat + "STATUS",   a, false);
+      mqttPub(tStat + "STATUS2",  b, false);
+      mqttPub(tStat + "STATUS5",  c, false);
+      mqttPub(tStat + "STATUS11", d, false);
+    }
+
+    r  = "{";
+    r += semChaves(a); r += ",";
+    r += semChaves(b); r += ",";
+    r += semChaves(c); r += ",";
+    r += semChaves(d);
+    r += "}";
+
+    return r;
+  }
+
+  const char *sufixo = "STATUS";
+
+  if (n == 2)       { r = jsonStatusFWR(); sufixo = "STATUS2";  }
+  else if (n == 5)  { r = jsonStatusNET(); sufixo = "STATUS5";  }
+  else if (n == 11) { r = jsonStatusSTS(); sufixo = "STATUS11"; }
+  else              { r = jsonStatus(); }
+
+  if (viaMqtt)
+    mqttPub(tStat + sufixo, r, false);
+
+  return r;
+}
+
+// Executa um comando vindo do MQTT (viaMqtt = true, resposta também publicada em stat/)
+// ou do HTTP /cm (viaMqtt = false, resposta só retornada). Devolve o JSON de resposta.
+String executaComando(String cmd, String arg, bool viaMqtt)
+{
+  String resp;
+
+  cmd.trim();
+  cmd.toUpperCase();
+  arg.trim();
+
+  if (cmd == "POWER" || cmd == "POWER1")
+  {
+    switch (interpretaAcao(arg))
+    {
+      case 1:  solicitaLigamento();        break;
+      case 0:  solicitaDesligamento(-1);   break;   // desligamento agendado (WebHook + espera)
+      case 2:  alternaRele();              break;
+      default: if (viaMqtt) publicaPower(); break;  // sem argumento = consulta
+    }
+
+    return jsonPower();   // as mudanças de estado já publicam stat/POWER e stat/RESULT
+  }
+
+  if (cmd == "STATE")
+  {
+    resp = jsonEstado();
+
+    if (viaMqtt)
+      mqttPub(tTele + "STATE", resp, false);
+
+    return resp;
+  }
+
+  if (cmd == "STATUS")
+    return comandoStatus(arg, viaMqtt);
+
+  if (cmd == "RESTART")
+  {
+    if (arg == "1")
+    {
+      resp = F("{\"Restart\":\"Restarting\"}");
+      agendaReinicio();
+    }
+    else
+      resp = F("{\"Restart\":\"1 to restart\"}");
+  }
+  else if (cmd == "TELEPERIOD")
+  {
+    if (ehNumero(arg))
+    {
+      long v = arg.toInt();
+
+      if (v == 1)
+        v = TELE_PERIODO_PADRAO;
+
+      if (v == 0 || (v >= 10 && v <= 3600))
+      {
+        telePeriodo = (unsigned long)v;
+        dev.TelePeriod = String(v);
+        gravaConfig();
+      }
+    }
+
+    resp = F("{\"TelePeriod\":");
+    resp += (unsigned long)telePeriodo;
+    resp += F("}");
+  }
+  else
+    resp = F("{\"Command\":\"Unknown\"}");
+
+  if (viaMqtt)
+    mqttPub(tStat + "RESULT", resp, false);
+
+  return resp;
+}
+
+// =====================================================
+// MQTT - CONEXÃO E RECEPÇÃO
+// =====================================================
+
+// Chamada de dentro do PubSubClient::loop(). Só guarda o comando; quem executa é o
+// loop() principal (publicar aqui dentro sobrescreveria o buffer do payload recebido).
+void recebendoMensagensMQTT(char* topic, byte* payload, unsigned int length)
+{
+  if (cmdPendente)
+    return;
+
+  String t(topic);
+  String arg;
+  unsigned int n = (length > 64) ? 64 : length;
+
+  arg.reserve(n);
+
+  for (unsigned int i = 0; i < n; i++)
+    arg += (char)payload[i];
+
+  String comando = t.substring(t.lastIndexOf('/') + 1);
+
+#if MQTT_LEGADO
+  if (t == tLegado + "/set")   // esp8266/<topico>/set  ->  POWER
+    comando = "POWER";
+#endif
+
+  cmdPend = comando;
+  argPend = arg;
+  cmdPendente = true;
+}
+
+void processaComandoPendente()
+{
+  if (!cmdPendente)
+    return;
+
+  String c = cmdPend;
+  String a = argPend;
+
+  cmdPendente = false;
+
+  executaComando(c, a, true);
+}
+
+bool conectaMQTT()
+{
+  if (!dev.IPMqtt.length())
+    return false;
+
+  String lwt = tTele + "LWT";
+  bool ok;
+
+  // LWT igual ao do Tasmota: se o aparelho cair, o broker publica "Offline"
+  if (dev.Mqttuser.length())
+    ok = ConexaoMQTT.connect(idCliente.c_str(), dev.Mqttuser.c_str(), dev.Mqttpass.c_str(), lwt.c_str(), 0, true, "Offline");
+  else
+    ok = ConexaoMQTT.connect(idCliente.c_str(), nullptr, nullptr, lwt.c_str(), 0, true, "Offline");
+
+  if (!ok)
+    return false;
+
+  contadorMqtt++;
+
+  ConexaoMQTT.subscribe((tCmnd + "+").c_str());
+  ConexaoMQTT.subscribe((tGrupo + "+").c_str());
+
+#if MQTT_LEGADO
+  ConexaoMQTT.subscribe((tLegado + "/set").c_str());
+#endif
+
+  publicaDiscovery();
+  mqttPub(lwt, "Online", true);   // o HA responde ao "Online" pedindo cmnd/<topico>/STATE
+  publicaInfo();
+  publicaPower();
+  publicaTele();
+
+  return true;
+}
+
+// Conexão sem travar o aparelho: tenta a cada 5 s, dobrando até 60 s enquanto o broker estiver fora.
+// (Antes, cada volta do loop() tentava conectar e bloqueava botão e página web.)
+void gerenciaMQTT()
+{
+  if (ConexaoMQTT.connected())
+  {
+    ConexaoMQTT.loop();
+    processaComandoPendente();
+
+    if (telePeriodo > 0 && (millis() - ultimoTele) >= telePeriodo * SEGUNDO)
+      publicaTele();
+
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  unsigned long agora = millis();
+
+  if ((agora - ultimaTentativaMqtt) < intervaloMqtt)
+    return;
+
+  ultimaTentativaMqtt = agora;
+
+  if (conectaMQTT())
+    intervaloMqtt = 0;
+  else if (intervaloMqtt == 0)
+    intervaloMqtt = 5000UL;
+  else
+  {
+    intervaloMqtt *= 2;
+
+    if (intervaloMqtt > 60000UL)
+      intervaloMqtt = 60000UL;
+  }
+}
+
+// (não usada no momento, mantida do código original)
+void sendMessage(const char *MESSAGE)
+{
+  String MSG = MESSAGE;
+  time_t now = time(nullptr);
+
+  String payload = "{";
+         payload += "\"msg\":\"" + jsonEsc(MSG) + "\",";
+         payload += "\"source\":\"esp8266\",";
+         payload += "\"device\":\"sensor_sala\",";
+         payload += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+         payload += "\"ts\":\"" + String((unsigned long)now) + "\"";
+         payload += "}";
+
+  ConexaoMQTT.publish("instagram/send", payload.c_str());
+}
+
+// =====================================================
+// WEB
+// =====================================================
+
+void handleRoot()
+{
+  String html = "<html><meta http-equiv='refresh' content='5'><body><pre>";
+
+  html += TEXTO_ABERTURA;
+  #ifdef ESP01
+      html += " - ESP-01/";
+  #else
+      html += " - ESP-8266/";
+  #endif
+
+  html +=  ARDUINO_BOARD;
+
+  html += " v";
+  html += VERSAO;
+  html += "\n";
+  html += "\n";
+
+  html += "IP: ";
+  html += WiFi.localIP().toString();
+  html += "\n";
+
+  html += "WebHook: ";
+  html += htmlEsc(dev.WebHookUrl);
+  html += "\n";
+
+  html += "Espera: ";
+  html += htmlEsc(dev.TempoParaDesligar);
+  html += "\n";
+
+  html += "Data/Hora: ";
+  html += textoDataHoraBR();
+
+  html += "\n";
+  html += "\n";
+
+  html += "Estado: ";
+  html += textoEstadoInterno();
+  html += "\n";
+
+  html += "MQTT: ";
+  html += ConexaoMQTT.connected() ? "conectado" : "desconectado";
+  html += " (";
+  html += htmlEsc(dev.IPMqtt);
+  html += ":";
+  html += htmlEsc(dev.Porta);
+  html += ")\n";
+
+  html += "Topico: ";
+  html += htmlEsc(dev.MqttTopico);
+  html += "\n";
+
+  html += "</pre></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleStatus()
+{
+  if (server.hasArg("rele"))
+  {
+    String valor = server.arg("rele");
+
+    valor.toUpperCase();
+
+    if (valor == "ON")
+      solicitaLigamento();
+    else if (valor == "OFF")
+    {
+      if (server.hasArg("timer"))
+        solicitaDesligamento(server.arg("timer").toInt());
+      else
+      {
+        desligamentoPendente = false;
+        setRele(false); // desligamneto imediato
+      }
+    }
+  }
+
+  server.send(200, "text/plain", textoEstadoInterno());
+}
+
+void handleStatusJson()
+{
+  String json = "{\"estado\":\"";
+
+  json += textoEstadoInterno();
+  json += "\",\"DataHora\":\"";
+  json += textoDataHoraBR();
+  json += "\",\"mqtt\":";
+  json += ConexaoMQTT.connected() ? "true" : "false";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// API de comandos do Tasmota: /cm?cmnd=Power%20On  ->  {"POWER":"ON"}
+void handleCm()
+{
+  String c = server.hasArg("cmnd") ? server.arg("cmnd") : String("");
+
+  c.trim();
+
+  if (!c.length())
+  {
+    server.send(200, "application/json", "{\"Command\":\"Unknown\"}");
+    return;
+  }
+
+  String cmd = c;
+  String arg = "";
+  int sp = c.indexOf(' ');
+
+  if (sp >= 0)
+  {
+    cmd = c.substring(0, sp);
+    arg = c.substring(sp + 1);
+  }
+
+  server.send(200, "application/json", executaComando(cmd, arg, false));
+}
+
+void handleReboot()
+{
+  server.send(200, "text/plain", "REBOOT");
+
+  finalizaMQTT();
+
+  delay(1000);
+
+  ESP.restart();
+}
+
+void handleFactoryReset()
+{
+  server.send(200, "text/plain", "RESET DE FABRICA");
+
+  finalizaMQTT();
+
+  delay(1000);
+
+  wfm.resetSettings();
+
+  // SPIFFS.format();
+
+  ESP.restart();
+}
+
+// =====================================================
+// BOTÃO
+// =====================================================
+void verificaBotaoReset()
+{
+#ifdef ESP01
+// se for ESP01... não faz nada, não tem Reset fisico
+#else
+  if (digitalRead(PIN_BOTAO_RESET) == LOW)
+  {
+    if (tempoBotaoReset == 0)
+      tempoBotaoReset = millis();
+
+    if (millis() - tempoBotaoReset > 10000)
+      handleFactoryReset();
+  }
+  else
+    tempoBotaoReset = 0;
+#endif
+}
+
+void lerBotao()
+{
+  unsigned long tempoAtual = millis();
+
+  if (tempoAtual - ultimaLeituraBotao < 100)
+    return;
+
+  ultimaLeituraBotao = tempoAtual;
+
+  int leitura = digitalRead(PIN_BOTAO);
+
+  if (leitura != UltimoValor)
+  {
+    UltimoValor = leitura;
+
+    alternaRele();
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(BAUD_RATE);
+  Serial.end();
+
+  // Relé e botão primeiro: o PC continua ligado enquanto o Wi-Fi conecta
+  // ou o portal de configuração está aberto (antes o relé só era configurado depois).
+  pinMode(PIN_RELE, OUTPUT);
+  digitalWrite(PIN_RELE, NIVEL_ON);
+  releLigado = true;
+
+  pinMode(PIN_BOTAO, INPUT_PULLUP);
+  UltimoValor = digitalRead(PIN_BOTAO);
+
+  openFS();
+
+  //wfm.resetSettings();  //
+  //SPIFFS.format();      //
+  //ESP.restart();        //
+
+  setupWiFiAuto();
+  montaTopicos();
+
+  configTime(UTC_OFFSET, UTC_OFFSET_DST, NTP_SERVER);
+
+  server.on("/",                     handleRoot);
+  server.on("/status",               handleStatus);
+  server.on("/reboot",               handleReboot);
+  server.on("/factoryreset",         handleFactoryReset);
+  server.on("/status/json",          handleStatusJson);
+  server.on("/cm",                   handleCm);
+
+  MDNS.begin(dev.Host);
+
+  atualizadorOTA.setup(&server);
+
+  server.begin();
+
+  MDNS.addService( "http", "tcp", 80);
+
+  ConexaoMQTT.setServer(dev.IPMqtt.c_str(), dev.Porta.toInt());
+  ConexaoMQTT.setCallback(recebendoMensagensMQTT);
+  ConexaoMQTT.setBufferSize(MQTT_BUFFER);
+  ConexaoMQTT.setKeepAlive(30);
+  ConexaoMQTT.setSocketTimeout(3);
+  wifiClient.setTimeout(2000);
+
+  gerenciaMQTT();   // primeira tentativa; se falhar, o loop() tenta de novo sem travar
+
+  ultimaLeituraBotao = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  uptimeMs();   // mantém o contador de uptime sem estouro
+
+  server.handleClient();
+  MDNS.update();
+
+  gerenciaMQTT();   // reconexão, mensagens recebidas, comandos e telemetria
+
+  // ====================================
+  // DESLIGAMENTO PROGRAMADO
+  // ====================================
+
+  verificaDesligamentoPendente();
+
+  lerBotao();
+  //verificaBotaoReset();
+
+  if (reiniciarPendente && (long)(millis() - reiniciarEm) >= 0)
+  {
+    finalizaMQTT();
+    ESP.restart();
+  }
+
+  yield();
+}
+
+//
+//  Tópicos Tasmota (substitua os valores entre < >)
+//
+//  mosquitto_pub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "cmnd/PowerPC-NAS-RPI5/POWER" -m "ON"
+//  mosquitto_pub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "cmnd/PowerPC-NAS-RPI5/POWER" -m "OFF"
+//  mosquitto_pub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "cmnd/PowerPC-NAS-RPI5/POWER" -m "TOGGLE"
+//  mosquitto_pub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "cmnd/PowerPC-NAS-RPI5/STATE"  -m ""
+//
+//  mosquitto_sub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "+/PowerPC-NAS-RPI5/#" -v
+//
+//  Tópicos antigos (continuam funcionando com MQTT_LEGADO 1)
+//
+//  mosquitto_pub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "esp8266/PowerPC-NAS-RPI5/set" -m "ON"
+//  mosquitto_pub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "esp8266/PowerPC-NAS-RPI5/set" -m "OFF"
+//  mosquitto_sub -h <BROKER> -p 1883 -u <USUARIO> -P <SENHA> -t "esp8266/PowerPC-NAS-RPI5/state" -v
+//
+//  HTTP
+//
+//  curl "http://<IP>/cm?cmnd=Power%20Off"
+//  curl "http://<IP>/status?rele=OFF&timer=2"
+//
